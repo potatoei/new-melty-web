@@ -1,0 +1,33 @@
+# Cloudflare deployment for the MBAACC asset tree.
+#
+# NOTE ON COMMANDS: `wrangler put` is not a Wrangler command. KV uploads are
+# `wrangler kv key put` (or `wrangler kv bulk put`); tools/cloudflare-upload.js
+# drives them, one key per part.
+#
+#   npx wrangler kv namespace create MBAA_ASSETS
+#     -> paste the returned id into kv_namespaces[0].id below
+#
+# The Worker (kv-worker.js) is what makes KV usable by the engine at all: KV has
+# no native HTTP Range support, and lib/byte-provider.js refuses to mount a lazy
+# archive without `Accept-Ranges: bytes` and a correct 206/Content-Range reply.
+
+name = "mbaa-assets"
+main = "kv-worker.js"
+compatibility_date = "2026-11-01"
+
+# Assets are read-mostly and immutable once named by content hash, so no durable
+# object is needed. This Worker is a byte server by design.
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "ASSETS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_PREVIEW_KV_NAMESPACE_ID"
+
+# The engine reads assets from the page's origin in dev and from this Worker in
+# production; nothing here is secret, so a plain var is enough.
+[vars]
+ASSET_PREFIX = "mbaa"
+
+# No [rules] block: a rule that rewrites a body is exactly what a part must never
+# go through. KV values are stored opaquely, and the Worker serves them as-is.

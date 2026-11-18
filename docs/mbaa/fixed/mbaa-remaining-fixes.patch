@@ -1,0 +1,424 @@
+From dccc20c92474b74302e5f135ec6ddc972a15b03a Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Wed, 18 Nov 2026 01:01:59 +0000
+Subject: [PATCH] mbaa: fix census extents for unsorted tables, policy silent
+ no-ops
+
+tools/mbaa-texture-census.js
+  * A member's extent is the distance to the next member IN THE FILE, not to
+    the next entry in the name table. Reading the successor out of the table
+    gave end === start (length 0, never classified, never pinned) for any
+    member whose table neighbour sat earlier in the file, while the member
+    before it swallowed every byte between them -- so a texture silently
+    streamed instead of being pinned, which is the exact failure the tool
+    exists to remove, and it failed with no message. Extents now come from the
+    sorted offset list; table order is kept so names still pair.
+
+lib/app-files.js
+  * An unsized preloadAssets name was emitted as {loadMode:'required',
+    size:null}; host.js rejects that at launch ('Invalid manifest size'), so a
+    typo or a missing size turned a slow launch into no launch. It is now left
+    as it was, reported in summary.preloadSkipped and warned about.
+  * A preloadRanges key was matched case-sensitively against the URL leaf, so
+    {'0002.P': ...} silently matched nothing and the archive fell back to a
+    whole-file preload -- a 900MB launch from a table that looks right. Keys
+    now resolve exactly as preloadAssets names do (exact, URL, case-insensitive
+    leaf); a list measured on other bytes is refused AND reported; a table no
+    file consulted is called out by name instead of vanishing.
+
+Tests: test-mbaa-texture-census.js (unsorted table), test-app-files-switches.js
+(unsized preload, key spellings, size mismatch, unused table).
+
+Verified: build.sh 1765269 bytes, region hash c4c5e06a29d651ae, 1837 test
+files, silent-stub inventory pinned, nine related tests PASS.
+---
+ lib/app-files.js                 | 103 +++++++++++++++++++++++++++----
+ package-lock.json                |   2 -
+ test/test-app-files-switches.js  |  92 +++++++++++++++++++++++++++
+ test/test-mbaa-texture-census.js |  53 ++++++++++++++++
+ tools/mbaa-texture-census.js     |  29 ++++++++-
+ 5 files changed, 263 insertions(+), 16 deletions(-)
+
+diff --git a/lib/app-files.js b/lib/app-files.js
+index 2e84ca63..3f417505 100644
+--- a/lib/app-files.js
++++ b/lib/app-files.js
+@@ -159,6 +159,9 @@
+     // the guest's names.
+     const preload = preloadMatchers(app);
+     const rangeFor = rangeListFor(app);
++    const rangesUsed = rangeFor.used;
++    const rangesRefused = rangeFor.refused;
++    const rangesRefusedKeys = rangeFor.refusedKeys;
+     // A preloaded file with no measured ranges costs its WHOLE size at launch.
+     // That is the right answer for a 20 MB archive and the wrong one for
+     // MBAACC's 900 MB sprite pack, and the difference is invisible until the
+@@ -167,6 +170,7 @@
+     // launch, and the caller may well be on a fast pipe.
+     let preloadWholeBytes = 0;
+     const preloadWhole = [];
++    const preloadSkipped = [];
+     const out = list.map((file, i) => {
+       if (!fileUrl(file) || declaresLoading(file)) return file;
+       const size = sizes[i];
+@@ -174,19 +178,30 @@
+         preloadCandidates(file).some(path => preload.some(re => re.test(path)));
+       if (wanted) {
+         // Measured ranges: the app knows which bytes are textures, so only
+-        // those are launch cost and the rest keeps streaming.
+-        const ranges = rangeFor(file, size);
++        // those are launch cost and the rest keeps streaming. An UNSIZED file
++        // cannot be pinned at all -- there is no size to hang the list on and
++        // host.js rejects such an entry -- so this is checked before the
++        // ranges are consulted, not after.
++        const ranges = typeof size === 'number' ? rangeFor(file, size) : null;
+         if (ranges) {
+           const base = typeof file === 'string' ? { url: file } : { ...file };
+           return { ...base, size, loadMode: 'lazy', preloadRanges: ranges };
+         }
++        // A preload is only meaningful as a SIZED declaration: host.js rejects
++        // an entry whose `size` is not a safe integer, and an unsized name
++        // carries nothing to pin. Leaving the entry as it was streams it
++        // exactly as before -- the preload was always best-effort, and one
++        // unsized name must never take the launch down. `preloadSkipped` says
++        // so in the summary instead of passing silently.
++        if (typeof size !== 'number') {
++          preloadSkipped.push(leafOf(file));
++          return file;
++        }
+         // Whole file, with the launch window's progress and Cancel. `required`
+         // means a failure fails the launch instead of streaming on demand,
+         // which is the point: the guest caches a failed read as NULL forever.
+-        if (typeof size === 'number') {
+-          preloadWholeBytes += size;
+-          preloadWhole.push(`${leafOf(file)} ${(size / (1024 * 1024)).toFixed(0)}MB`);
+-        }
++        preloadWholeBytes += size;
++        preloadWhole.push(`${leafOf(file)} ${(size / (1024 * 1024)).toFixed(0)}MB`);
+         const base = typeof file === 'string' ? { url: file } : { ...file };
+         return { ...base, size, loadMode: 'required' };
+       }
+@@ -213,6 +228,38 @@
+         + 'preloadRanges to preload only the bytes the guest reads before it can park.');
+       summary.preloadWholeBytes = preloadWholeBytes;
+     }
++    // One entry that cannot be pinned is otherwise invisible: the launch looks
++    // exactly like one where the preload was never declared, which is how a
++    // typo in `preloadAssets` or a missing `.size` turns into a mid-battle
++    // Loading window that nobody connects back to the policy.
++    if (preloadSkipped.length) {
++      console.warn(`[files] ${(app && app.id) || 'app'}: preloadAssets names `
++        + `${preloadSkipped.length} file(s) with no known size (${preloadSkipped.join(', ')}); `
++        + 'they stream as before. A preload needs a measured size to pin anything.');
++      summary.preloadSkipped = preloadSkipped;
++    }
++    if (rangesRefused.length) {
++      console.warn(`[files] ${(app && app.id) || 'app'}: preloadRanges refused `
++        + `${rangesRefused.length} list(s) measured against a different file `
++        + `(${rangesRefused.join(', ')}); those fall back to a whole-file preload. `
++        + 'Re-run tools/mbaa-texture-census.js against the file the manifest declares.');
++      summary.preloadRangesRefused = rangesRefused;
++    }
++    // A declared table whose keys matched no preloaded file is the quietest
++    // failure in this whole policy: launch stays at a gigabyte and the census
++    // output beside it looks correct. Name the keys that were never consulted.
++    if (app && app.preloadRanges && typeof app.preloadRanges === 'object' &&
++        rangesUsed.size === 0 && preload.length) {
++      // A key that DID match but whose list was refused is already reported
++      // above; only the keys nothing ever consulted are news here.
++      const keys = Object.keys(app.preloadRanges).filter(key =>
++        !rangesRefusedKeys.has(String(key).replace(/[?#].*$/, '').replace(/^.*[\\/]/, '').toLowerCase()));
++      if (keys.length) {
++        console.warn(`[files] ${(app && app.id) || 'app'}: preloadRanges declares `
++          + `${keys.join(', ')} but no preloaded file matched those keys; the ranges are unused.`);
++        summary.preloadRangesUnused = keys;
++      }
++    }
+     return finish(out, 'lazy');
+   }
+ 
+@@ -273,18 +320,50 @@
+   // mount time: pinning the wrong bytes is worse than not preloading.
+   function rangeListFor(app) {
+     const table = app && app.preloadRanges;
+-    if (!table) return () => null;
+-    return (file, size) => {
+-      const leaf = fileUrl(file).replace(/[?#].*$/, '').replace(/^.*[\\/]/, '');
+-      const value = typeof table === 'function' ? table(file, size)
+-        : (table[leaf] || table[fileUrl(file)] || null);
++    const used = new Set(), refused = [], refusedKeys = new Set();
++    // Resolve a table key the same way a preloadAsset name resolves: an exact
++    // key, the URL, then the URL leaf in EITHER case. `leaf` used to be
++    // compared case-sensitively, so `{"0002.P": ...}` (or any census file
++    // renamed on the way in) silently matched nothing and the archive fell
++    // back to a whole-file preload -- a 900MB launch from a key that looks
++    // right. A refusal is reported by the caller rather than swallowed.
++    const at = (key) => (key && Object.prototype.hasOwnProperty.call(table, key) ? table[key] : null);
++    const resolve = (file, size) => {
++      if (!table) return null;
++      const url = fileUrl(file);
++      const leaf = url.replace(/[?#].*$/, '').replace(/^.*[\\/]/, '');
++      let value = typeof table === 'function' ? table(file, size) : null;
++      if (value === null && typeof table !== 'function') {
++        value = at(leaf) || at(url) || at(url.replace(/[?#].*$/, '')) || null;
++        if (value === null) {
++          // Last resort: a case-insensitive match on the leaf, which is the
++          // spelling a Windows-minded author writes.
++          const lower = leaf.toLowerCase();
++          for (const key of Object.keys(table)) {
++            if (key.replace(/[?#].*$/, '').replace(/^.*[\\/]/, '').toLowerCase() === lower) {
++              value = table[key];
++              break;
++            }
++          }
++        }
++      }
+       if (!value) return null;
+       const list = Array.isArray(value) ? value : value.ranges;
+       if (!Array.isArray(list) || !list.length) return null;
++      // Measured on other bytes: refuse the list (pinning the wrong ranges is
++      // worse than pinning none) and say which file disagreed, because the
++      // caller's next move -- re-run the census against the deployed file --
++      // depends on knowing it was the size and not the key that missed.
+       if (!Array.isArray(value) && Number.isSafeInteger(value.size) &&
+-          Number.isSafeInteger(size) && value.size !== size) return null;
++          Number.isSafeInteger(size) && value.size !== size) {
++        refused.push(`${leaf || url} (declared ${value.size}B, file is ${size}B)`);
++        refusedKeys.add((leaf || url).toLowerCase());
++        return null;
++      }
++      used.add(leaf || url);
+       return { schemaVersion: 1, ...(Number.isSafeInteger(size) ? { size } : {}), ranges: list };
+     };
++    return Object.assign(resolve, { used, refused, refusedKeys });
+   }
+ 
+   // A registry entry can carry `iniSet: {Section: {Key: 'value'}}` to change
+diff --git a/package-lock.json b/package-lock.json
+index 41520aab..34a9d61d 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -9,8 +9,6 @@
+       "version": "1.0.0",
+       "license": "ISC",
+       "dependencies": {
+-        "@node-3d/glfw": "*",
+-        "@node-3d/webgl": "*",
+         "pngjs": "^7.0.0",
+         "wabt": "^1.0.39"
+       },
+diff --git a/test/test-app-files-switches.js b/test/test-app-files-switches.js
+index ecaffeea..504895d3 100644
+--- a/test/test-app-files-switches.js
++++ b/test/test-app-files-switches.js
+@@ -68,6 +68,98 @@ const app = { id: 'mbaa', preloadAssets: ['0002.p', '0003.p'] };
+     'with nothing preloaded there is no launch cost to report');
+ }
+ 
++// ---- a preload that cannot be pinned must not become a broken launch ------
++//
++// host.js refuses a manifest entry whose `size` is not a safe integer, so a
++// `preloadAssets` name with no measured size used to be emitted as
++// `{loadMode:'required', size:null}` -- which is not a slow launch, it is a
++// launch that THROWS. Worse in the other direction: a name that matches
++// nothing at all looks exactly like a preload that was never declared.
++{
++  const unsized = [{ url: 'binaries/mbaa/mystery.p', vfsPaths: ['c:\\mystery.p'] }];
++  const warned = [];
++  const realWarn = console.warn;
++  console.warn = m => warned.push(String(m));
++  let policy;
++  try {
++    policy = normalizeLazyFiles(
++      { id: 'mbaa', preloadAssets: ['mystery.p'], preloadRanges: { 'mystery.p': { schemaVersion: 1, ranges: [[0, 4096]] } } },
++      unsized, { sizeOf: () => null });
++  } finally { console.warn = realWarn; }
++
++  const entry = policy.files[0];
++  assert.strictEqual(entry.loadMode, undefined,
++    'an unsized preload is left as it was rather than emitted as a required/null-size entry host.js rejects');
++  assert.ok(!(entry.loadMode !== undefined && !Number.isSafeInteger(entry.size)),
++    'nothing that host.js would reject at launch survives the policy');
++  assert.deepStrictEqual(policy.summary.preloadSkipped, ['mystery.p'],
++    'and the skipped name is reported instead of silently streaming');
++  assert.ok(warned.some(m => /no known size/.test(m)),
++    'with a warning that names it');
++}
++
++// ---- a ranges key resolves the way a preload name does -------------------
++//
++// The census writes `0002.p`; an author may paste it as `0002.P`, or key on
++// the URL. A case-sensitive miss used to fall through to a whole-file preload,
++// i.e. a 900 MB launch from a table that looks correct.
++{
++  const wide = [{ url: 'binaries/mbaa/0002.p', size: 900 * MB, vfsPaths: ['c:\\0002.p'] }];
++  for (const key of ['0002.p', '0002.P', 'binaries/mbaa/0002.p']) {
++    const policy = normalizeLazyFiles(
++      { id: 'mbaa', preloadAssets: ['0002.p'],
++        preloadRanges: { [key]: { schemaVersion: 1, size: 900 * MB, ranges: [[0, 4096], [100, 200]] } } },
++      wide, { sizeOf });
++    const entry = policy.files[0];
++    assert.strictEqual(entry.loadMode, 'lazy', `key ${key}: the measured ranges are used`);
++    assert.deepStrictEqual(entry.preloadRanges.ranges, [[0, 4096], [100, 200]],
++      `key ${key}: the ranges ride along`);
++    assert.strictEqual(policy.summary.preloadWholeBytes, undefined,
++      `key ${key}: so the launch is not a gigabyte`);
++  }
++
++  // A list measured on other bytes is refused (pinning the wrong ranges is
++  // worse than pinning none) AND reported, because the remedy is re-running
++  // the census and that is not obvious from a silent fallback.
++  const warned = [];
++  const realWarn = console.warn;
++  console.warn = m => warned.push(String(m));
++  let mismatch;
++  try {
++    mismatch = normalizeLazyFiles(
++      { id: 'mbaa', preloadAssets: ['0002.p'],
++        preloadRanges: { '0002.p': { schemaVersion: 1, size: 123, ranges: [[0, 4096]] } } },
++      wide, { sizeOf });
++  } finally { console.warn = realWarn; }
++  assert.strictEqual(mismatch.files[0].loadMode, 'required',
++    'a size mismatch falls back to the whole-file preload');
++  assert.ok(mismatch.summary.preloadRangesRefused &&
++    /0002\.p/.test(mismatch.summary.preloadRangesRefused.join(' ')),
++    'and says which file disagreed');
++  assert.ok(warned.some(m => /measured against a different file/.test(m)),
++    'in the console, not just the summary');
++  assert.strictEqual(mismatch.summary.preloadRangesUnused, undefined,
++    'a key that matched but was refused is not also reported as unused');
++}
++
++// ---- a ranges table that matches nothing is called out -------------------
++{
++  const warned = [];
++  const realWarn = console.warn;
++  console.warn = m => warned.push(String(m));
++  let policy;
++  try {
++    policy = normalizeLazyFiles(
++      { id: 'mbaa', preloadAssets: ['0002.p'],
++        preloadRanges: { '9999.p': { schemaVersion: 1, size: 900 * MB, ranges: [[0, 1]] } } },
++      files, { sizeOf });
++  } finally { console.warn = realWarn; }
++  assert.deepStrictEqual(policy.summary.preloadRangesUnused, ['9999.p'],
++    'a declared key no file consulted is reported by name');
++  assert.ok(warned.some(m => /the ranges are unused/.test(m)),
++    'and warned about: otherwise the census output looks correct while launch stays at a gigabyte');
++}
++
+ // ---- the switch is a launch-time decision, and it says so in the URL ------
+ const shell = require('fs').readFileSync(
+   path.join(__dirname, '..', 'lib', 'browser-shell.js'), 'utf8');
+diff --git a/test/test-mbaa-texture-census.js b/test/test-mbaa-texture-census.js
+index 06782d2c..f89ff8b0 100644
+--- a/test/test-mbaa-texture-census.js
++++ b/test/test-mbaa-texture-census.js
+@@ -146,6 +146,59 @@ for (const [label, corrupt] of [
+   assert.ok(!fs.existsSync(path.join(dir, 'too-big.json')), 'and writes nothing');
+ }
+ 
++// A container is free to store its name table in an order that is NOT the
++// order the members occupy in the file. The extent of a member is the distance
++// to the next member IN THE FILE, so a table sorted by name (or by anything
++// else) must still yield the real extents. Reading the successor out of the
++// table instead gave end === start for any member whose table neighbour sat
++// earlier in the file -- length 0, unclassifiable, silently NOT pinned -- while
++// the member before it swallowed everything between them. The archive then
++// streamed a sprite it was supposed to pin, which is the exact failure the
++// tool exists to prevent, and it failed without a message.
++{
++  const names = ['a_tex.bin', 'b_other.bin', 'c_tex.bin'];
++  const datas = [
++    textureMember(8, 8, 0x11),      // 80 bytes
++    otherMember(500),
++    textureMember(16, 16, 0x33),    // 272 bytes
++  ];
++  // Table order: a_tex.bin, c_tex.bin, b_other.bin -- i.e. file offsets 0, 2, 1.
++  // The NAMES are stored in table order (that is how the walker reads them);
++  // it is the OFFSETS that are out of file order, which is the defect below.
++  const order = [0, 2, 1];
++  const nameBlob = Buffer.from(order.map(i => names[i] + '\0').join(''), 'latin1');
++  const namesAt = 16, tableLength = 3 * 8;
++  const dataAt = namesAt + tableLength + nameBlob.length;
++  const fileOff = [dataAt, dataAt + datas[0].length, dataAt + datas[0].length + datas[1].length];
++  const header = Buffer.alloc(16);
++  header.writeUInt32LE(3, 4); header.writeUInt32LE(namesAt, 8); header.writeUInt32LE(dataAt, 12);
++  const table = Buffer.alloc(tableLength);
++  order.forEach((memberIndex, slot) => {
++    table.writeUInt32LE(fileOff[memberIndex], slot * 8);
++    table.writeUInt32LE(names[memberIndex].length + 1, slot * 8 + 4);
++  });
++  const archive = path.join(dir, 'unsorted-table.p');
++  fs.writeFileSync(archive, Buffer.concat([header, table, nameBlob, ...datas]));
++
++  const out = path.join(dir, 'unsorted-table.json');
++  const result = run(archive, `--out=${out}`);
++  assert.strictEqual(result.code, 0, `an unsorted table still parses: ${result.stderr}`);
++  const list = JSON.parse(fs.readFileSync(out, 'utf8'));
++  const ranges = preloadRangesFor(list, fs.statSync(archive).size);
++  const pinned = ranges.reduce((sum, r) => sum + (r[1] - r[0]), 0);
++  assert.strictEqual(pinned, datas[0].length + datas[2].length,
++    'both texture members are pinned even though the table is not in file order');
++  // ...and the non-texture member between them stays out of the pin set.
++  const otherStart = fileOff[1];
++  assert.ok(!ranges.some(([start, end]) => start <= otherStart && end > otherStart),
++    'the non-texture member is not swallowed by a neighbour\'s extent');
++  // Every member has a real extent: no zero-length members from a bad successor.
++  const listed = run(archive, '--json');
++  const parsed = JSON.parse(listed.stdout);
++  assert.ok(parsed.list.every(m => m.length > 0), 'no member has a zero-length extent');
++  assert.strictEqual(parsed.textureMembers, 2, 'both textures are still classified');
++}
++
+ // --list and --json are diagnostics and must not need --out.
+ {
+   const list = run(path.join(dir, 'shape-A.p'), '--json');
+diff --git a/tools/mbaa-texture-census.js b/tools/mbaa-texture-census.js
+index 8ac17ae6..385257b4 100644
+--- a/tools/mbaa-texture-census.js
++++ b/tools/mbaa-texture-census.js
+@@ -160,13 +160,38 @@ function readContainer(rawHeader, fileSize, read) {
+     { name: 'len', step: (len) => len },         // length includes the NUL
+     { name: '2+len', step: (len) => len + 2 },   // "\0name\0" with len = name
+   ];
++  // A member's length is the distance to the NEXT member IN THE FILE, not to
++  // the next entry in the table. The two are the same only when the table
++  // happens to be sorted by offset, and a container is free to store its
++  // table in any order (Name ordering, or the order the packer wrote them).
++  // Reading the successor from the table made an unsorted archive produce
++  // nonsense extents -- a member whose successor in the table sits earlier in
++  // the file got end === start (length 0, invisible to classify()), and the
++  // member before it swallowed every byte between them. The size was then
++  // nonsense too, so the pinned range silently did not cover the sprite and
++  // the launch still parked in a battle: exactly the failure this tool exists
++  // to remove. Derive the extent from the SORTED offset list instead, and keep
++  // the members in table order so the names still pair with their offsets.
+   const members = (names) => {
++    const starts = [];
++    for (let i = 0; i < count; i++) {
++      if (offsets[i] >= dataAt && offsets[i] < fileSize) starts.push(offsets[i]);
++    }
++    starts.sort((a, b) => a - b);
++    const nextAfter = (start) => {
++      // First start strictly greater than this one; the last member ends at EOF.
++      let lo = 0, hi = starts.length;
++      while (lo < hi) {
++        const mid = (lo + hi) >> 1;
++        if (starts[mid] <= start) lo = mid + 1; else hi = mid;
++      }
++      return lo < starts.length ? starts[lo] : fileSize;
++    };
+     const out = [];
+     for (let i = 0; i < count; i++) {
+       const start = offsets[i];
+       if (start < dataAt || start >= fileSize) continue;   // sentinel/empty member
+-      const next = i + 1 < count ? offsets[i + 1] : fileSize;
+-      const finish = Math.min(fileSize, Math.max(start, next));
++      const finish = Math.min(fileSize, Math.max(start, nextAfter(start)));
+       out.push({ index: i, name: names[i], start, end: finish, length: finish - start });
+     }
+     return out;
+-- 
+2.39.5
+
