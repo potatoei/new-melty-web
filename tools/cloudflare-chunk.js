@@ -44,6 +44,19 @@ const CLOUDFLARE_MAX_OBJECT = 25 * 1024 * 1024;
 const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;   // berrry's own split size
 const HARD_MAX_BYTES = 24 * 1024 * 1024;      // headroom under the limit
 
+// The LOADER's end-of-parts rule, which is NOT the same as the part size we
+// write. host.js decides a part list is finished when a part is shorter than
+// ASSET_PART_SIZE (host.js:552, 10 MiB). Two consequences, and the second one
+// bit this tool:
+//   * a part list whose last part is >= 10 MiB makes the reader fetch one more
+//     part than exists;
+//   * lib/byte-provider.js's ranged mount tolerates that (it breaks on the 404),
+//     but host.js fetchAssetBytes -- the whole-file path used for a `required`
+//     preload -- THROWS "missing <part>". Same split, works ranged, fails eager.
+// So a trailing empty marker is emitted whenever the last part is not already
+// below the threshold, not only on an exact multiple.
+const LOADER_PART_EOF_BYTES = 10 * 1024 * 1024;   // host.js ASSET_PART_SIZE
+
 function usage() {
   console.error('usage: cloudflare-chunk.js <dir> --out=<dir> [--max-bytes=N] ' +
     '[--only=a.p,b.p] [--manifest=FILE] [--verify-only] [--json]');
@@ -83,6 +96,13 @@ if (!VERIFY_ONLY && !outArg) usage();
 const ASSET_EXTENSIONS = new Set([
   '.p', '.bin', '.dat', '.exe', '.dll', '.wav', '.mp3', '.ogg', '.avi', '.bmp',
   '.png', '.jpg', '.jpeg', '.ttf', '.otf', '.wasm', '.pak', '.idx', '.sav',
+  // An MBCZ container (tools/compress-assets.js) is chunked INSTEAD of the
+  // archive it was packed from -- compress, then chunk, is the only order that
+  // keeps the container's index offsets meaningful. Without this entry the
+  // documented sequence failed with "--only names 0002.p.mbcz but the directory
+  // has no such file", which reads as a missing file rather than an unlisted
+  // extension.
+  '.mbcz',
 ]);
 
 function partName(name, index) {
@@ -124,9 +144,13 @@ function splitFile(filePath, name, outDir) {
       parts.push({ name: target, index, offset, length, sha256: sha256(fs.readFileSync(outPath)) });
       offset += length;
     }
-    // An exact multiple ends with an empty marker so the loader's "short part
-    // means EOF" rule terminates instead of 404-proofing the next index.
-    if (total > 0 && total % maxBytes === 0) {
+    // An empty marker ends the list explicitly. It is needed whenever the last
+    // real part is not already below the loader's EOF threshold -- which is
+    // every exact multiple, but ALSO any tail between 10 MiB and maxBytes (a
+    // 20 MiB part size leaves 10-20 MiB tails that the eager path cannot
+    // terminate on). The marker is zero bytes, so it is also a valid KV value.
+    const lastLength = parts.length ? parts[parts.length - 1].length : 0;
+    if (total > 0 && (total % maxBytes === 0 || lastLength >= LOADER_PART_EOF_BYTES)) {
       const marker = partName(name, parts.length);
       fs.writeFileSync(path.join(outDir, marker), Buffer.alloc(0));
       parts.push({ name: marker, index: parts.length, offset: total, length: 0,
@@ -228,7 +252,8 @@ const manifest = {
   conventions: {
     partName: '<name>.partNNN',
     shortPartMarksEof: true,
-    emptyMarkerOnExactMultiple: true,
+    eofThresholdBytes: LOADER_PART_EOF_BYTES,
+    emptyMarkerWhenTailNotBelowEof: true,
     compression: 'none',
   },
   files: files.map(record => ({

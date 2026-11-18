@@ -175,6 +175,39 @@ function chunkerTests() {
     }
   }
 
+  // THE TERMINATION RULE. host.js ends a part list on the first part shorter
+  // than ASSET_PART_SIZE (10 MiB), and its eager path THROWS if the next index
+  // 404s. With 20 MiB parts, a file whose tail lands between 10 and 20 MiB ends
+  // on a full-size part, so the eager reader asks for one part too many and
+  // fails -- while the ranged reader tolerates it and works. Same split, two
+  // behaviours, which is the kind of difference that only shows up in one code
+  // path at a time. The splitter therefore emits a zero-byte marker whenever the
+  // last real part is not already below the threshold.
+  {
+    const EOF = 10 * 1024 * 1024;
+    const tailDir = path.join(dir, 'tailsrc');
+    const tailOut = path.join(dir, 'tailout');
+    fs.mkdirSync(tailDir);
+    // 3 x 20 MiB + a 15 MiB tail: the tail is >= EOF, so it needs a marker.
+    fs.writeFileSync(path.join(tailDir, 'tail.p'), Buffer.alloc(20 * 1024 * 1024 * 3 + 15 * 1024 * 1024, 0x41));
+    run([CHUNKER, tailDir, `--out=${tailOut}`, '--max-bytes=' + String(20 * 1024 * 1024)]);
+    const parts = fs.readdirSync(tailOut).filter(f => /\.part\d{3}$/.test(f)).sort();
+    const sizes = parts.map(f => fs.statSync(path.join(tailOut, f)).size);
+    assert.strictEqual(sizes[sizes.length - 1], 0,
+      'a tail at or above the 10 MiB EOF threshold ends with an empty marker');
+    // Simulate BOTH readers over the emitted list.
+    let total = 0;
+    for (let i = 0; ; i++) {
+      const name = parts.find(f => f.endsWith('.part' + String(i).padStart(3, '0')));
+      assert.ok(name, `part ${i} exists (the eager reader would throw here)`);
+      const size = fs.statSync(path.join(tailOut, name)).size;
+      total += size;
+      if (size < EOF) break;
+    }
+    assert.strictEqual(total, 20 * 1024 * 1024 * 3 + 15 * 1024 * 1024,
+      'the marker-terminated list rebuilds the exact file');
+  }
+
   // A refusal is a refusal: a --max-bytes at or over the limit must exit
   // non-zero rather than write parts that cannot be uploaded.
   let refused = false;
