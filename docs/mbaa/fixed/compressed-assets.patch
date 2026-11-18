@@ -1,0 +1,1025 @@
+From 9aa475502b4f1499fdf1b81fab442d38386f4527 Mon Sep 17 00:00:00 2001
+From: Arena Agent <agent@arena.ai>
+Date: Wed, 18 Nov 2026 02:49:45 +0000
+Subject: [PATCH] assets: seekable block compression (MBCZ) with a
+ decompressing provider
+
+Compresses the archives on the wire without changing a byte the guest sees.
+
+lib/compressed-provider.js
+  * MBCZ container: 32-byte header (magic/version/codec/blockSize/blockCount/
+    originalSize/indexOffset/headerCRC32), independently deflated blocks, then a
+    16-byte-per-block index (compressedOffset, compressedLength, originalLength,
+    flags). Any read costs only the blocks it overlaps.
+  * A block that does not compress is STORED and flagged, so an already-packed
+    asset cannot grow.
+  * Presents the ORIGINAL size, so ChunkCache, the VFS, preloadRanges and the
+    guest all see an uncompressed file. Refuses to mount a container whose
+    header CRC, block count, offsets or total length disagree -- and refuses a
+    block whose inflated length differs from the index, rather than serving
+    shifted bytes.
+
+tools/compress-assets.js
+  * Packs, and --verify re-inflates every block through the same parser and
+    compares the reassembled file with the source.
+
+host.js / lib/app-files.js / index.html
+  * compressed:true plus compressedSize mounts the container through the
+    provider inside the asset cache. lib/app-files.js passes such an entry
+    through untouched: its size is the DECOMPRESSED length, so every size rule
+    there (required whole-file preload, httpRange) would be answering about the
+    wrong number.
+  * Registered lib/compressed-provider.js in the page's script list.
+
+test/test-compressed-provider.js
+  * Real packer + real provider through the real ChunkCache: sequential,
+    block-boundary, unaligned, past-EOF and sync reads all byte-exact; stored
+    blocks asserted; four corruptions and an inflated-length mismatch refused.
+    Verified to fail against the packer bug it was written for (a positioned
+    header write followed by unpositioned payload writes overwrote the header).
+
+Measured on this project's data shape: block size barely matters (64KB and 1MB
+both land within ~1% of whole-file gzip on mixed assets), so 256KB is chosen for
+1MB-read locality, not for ratio.
+---
+ host.js                          |  27 ++-
+ index.html                       |   1 +
+ lib/app-files.js                 |  17 +-
+ lib/compressed-provider.js       | 359 +++++++++++++++++++++++++++++++
+ test/test-compressed-provider.js | 180 ++++++++++++++++
+ tools/compress-assets.js         | 318 +++++++++++++++++++++++++++
+ 6 files changed, 900 insertions(+), 2 deletions(-)
+ create mode 100644 lib/compressed-provider.js
+ create mode 100644 test/test-compressed-provider.js
+ create mode 100644 tools/compress-assets.js
+
+diff --git a/host.js b/host.js
+index 3ed33051..1aeb969f 100644
+--- a/host.js
++++ b/host.js
+@@ -4058,7 +4058,7 @@ class WineAssembly {
+                 const sizedHttpRange = !sizedRange && item && item.httpRange === true &&
+                   Number.isSafeInteger(item.size) && item.size >= 0 &&
+                   item.size <= WineAssembly.ASSET_PART_SIZE && !item.preloadRanges;
+-                const provider = sizedRange
++                let provider = sizedRange
+                   ? new window.byteProvider.HttpRangeProvider(url, item.size, rangeOptions)
+                   : sizedHttpRange
+                     ? new window.byteProvider.HttpRangeProvider(url, item.size, { ...rangeOptions, acceptWhole: true })
+@@ -4076,6 +4076,31 @@ class WineAssembly {
+                 // Game data on the server: a parked read of it gets the
+                 // in-game wait window and Retry (see _fillParkedRead).
+                 cache.gameData = true;
++                // A block-compressed container (tools/compress-assets.js) is
++                // wrapped HERE, inside the asset cache, so everything above --
++                // ChunkCache, preloadRanges, the VFS, the guest -- sees the
++                // ORIGINAL size and the original bytes. `compressedSize` is the
++                // on-the-wire length of the container and is required: without
++                // it there is nothing to check the container's own index
++                // against, and a mount over the wrong bytes would answer every
++                // read from the wrong offset.
++                if (item && item.compressed === true) {
++                  const CP = typeof window !== 'undefined' ? window.compressedProvider : null;
++                  if (!CP) throw new Error('Manifest declares a compressed asset but lib/compressed-provider.js is not loaded: ' + url);
++                  if (Number.isSafeInteger(item.compressedSize) && item.compressedSize !== provider.size) {
++                    throw new Error(`compressed asset ${url} is ${provider.size} bytes on the wire, manifest says ${item.compressedSize}`);
++                  }
++                  try {
++                    provider = await CP.CompressedProvider.open(provider, { name: url });
++                  } catch (error) {
++                    // Refusing beats mounting a container we cannot parse: a
++                    // wrong mount hands the guest plausible garbage at every
++                    // offset, and the guest caches that as NULL forever.
++                    error.assetUrl = url;
++                    error.isDownloadError = true;
++                    throw error;
++                  }
++                }
+                 if (item.preloadRanges) {
+                   // Some of this file is read where the guest cannot park
+                   // (Diablo: Storm's UI art, read inside a synchronous
+diff --git a/index.html b/index.html
+index 6e0e4126..481af891 100644
+--- a/index.html
++++ b/index.html
+@@ -2052,6 +2052,7 @@ Resource-aware Win98 emulator
+       "lib/overlay-store.js",
+       "lib/vfs-overlay.js",
+       "lib/byte-provider.js",
++      "lib/compressed-provider.js",
+       "lib/main-io-wait.js",
+       "lib/app-files.js",
+       "lib/startup-clock.js",
+diff --git a/lib/app-files.js b/lib/app-files.js
+index 3f417505..e8483aa2 100644
+--- a/lib/app-files.js
++++ b/lib/app-files.js
+@@ -55,6 +55,15 @@
+     return url ? url.replace(/^.*\//, '') : String(file && file.url || file);
+   }
+ 
++  // `compressed: true` names a container in lib/compressed-provider.js's MBCZ
++  // format. Its `size` is the DECOMPRESSED length (that is what the guest and
++  // the VFS must see) and `compressedSize` is the length on the wire, so every
++  // size-based rule in this file would otherwise be answering about the wrong
++  // number -- and the size mismatch is exactly what the preload policy refuses.
++  function declaresCompressed(file) {
++    return !!(file && typeof file === 'object' && file.compressed === true);
++  }
++
+   // Read by something that cannot park on a cache miss: the PE/DLL loader
+   // (images, codecs, plug-ins, type libraries), resource and font loading,
+   // INI/registry-ish config, fonts and WinHelp.
+@@ -172,7 +181,13 @@
+     const preloadWhole = [];
+     const preloadSkipped = [];
+     const out = list.map((file, i) => {
+-      if (!fileUrl(file) || declaresLoading(file)) return file;
++      // A block-compressed container is mounted by host.js through
++      // lib/compressed-provider.js, which presents the ORIGINAL size to
++      // everything above it. The policy must not re-derive that entry: forcing
++      // it 'required' would fetch the container whole (defeating the point of
++      // streaming it), and httpRange on a container whose manifest size is the
++      // decompressed length would ask the host for bytes that do not exist.
++      if (!fileUrl(file) || declaresLoading(file) || declaresCompressed(file)) return file;
+       const size = sizes[i];
+       const wanted = preload.length &&
+         preloadCandidates(file).some(path => preload.some(re => re.test(path)));
+diff --git a/lib/compressed-provider.js b/lib/compressed-provider.js
+new file mode 100644
+index 00000000..becafe4f
+--- /dev/null
++++ b/lib/compressed-provider.js
+@@ -0,0 +1,359 @@
++// Seekable-compressed byte provider: a block-compressed container served
++// through the same interface as HttpRangeProvider, so the guest reads the
++// ORIGINAL bytes and never learns the file is compressed.
++//
++// WHY A CONTAINER AND NOT gzip
++//
++// gzip/zstd on the whole file is not seekable: to answer `readRange(500_000_000,
++// 1MB)` you must inflate 500 MB first. The engine reads archives by byte range
++// exactly that way (lib/byte-provider.js HttpRangeProvider + ChunkCache), so a
++// whole-file codec would turn every read into a full decompression. This splits
++// the file into fixed-size blocks, compresses each independently, and keeps an
++// index -- so any range costs only the blocks it overlaps.
++//
++// The layer above (ChunkCache) caches 1MB chunks; this provider caches a small
++// number of inflated blocks so a 1MB chunk straddling two blocks does not
++// re-inflate on the next read. Both caches bound memory independently.
++//
++// FORMAT (little endian, 32-byte header)
++//
++//   0   'M' 'B' 'C' 'Z'
++//   4   u16 version = 1
++//   6   u16 codec   = 1 (deflate-raw)
++//   8   u32 blockSize
++//   12  u32 blockCount
++//   16  u32 originalSizeLow
++//   20  u32 originalSizeHigh
++//   24  u32 indexOffset
++//   28  u32 headerCrc32  (over bytes 0..27, this field excluded)
++//   32  block data, then the index at indexOffset
++//
++// Each index entry is 16 bytes:
++//   u32 compressedOffset (from file start), u32 compressedLength,
++//   u32 originalLength, u32 flags (0 = deflate-raw, 1 = stored)
++//
++// A block that does not compress is STORED and flagged, so incompressible
++// assets do not grow. Every block is independent; one corrupt block cannot
++// silently shift the bytes of another, because both its lengths are in the
++// index and are checked against what inflates.
++(function () {
++  'use strict';
++
++  const MAGIC = 0x5a43424d;          // 'MBCZ' little endian
++  const VERSION = 1;
++  const CODEC_DEFLATE = 1;
++  const HEADER_BYTES = 32;
++  const INDEX_ENTRY_BYTES = 16;
++  const FLAG_STORED = 1;
++
++  const isNode = typeof process !== 'undefined' && !!(process.versions && process.versions.node);
++  let nodeZlib = null;
++  if (isNode) {
++    try { nodeZlib = require('zlib'); } catch (_) { nodeZlib = null; }
++  }
++
++  function crc32(bytes) {
++    // Small table-based CRC-32, computed once. Only the 28-byte header uses it;
++    // block integrity is checked by comparing inflated length to the index.
++    if (!crc32.table) {
++      const table = new Uint32Array(256);
++      for (let i = 0; i < 256; i++) {
++        let c = i;
++        for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
++        table[i] = c >>> 0;
++      }
++      crc32.table = table;
++    }
++    let crc = 0xffffffff;
++    for (let i = 0; i < bytes.length; i++) {
++      crc = crc32.table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
++    }
++    return (crc ^ 0xffffffff) >>> 0;
++  }
++
++  function inflateRawSync(bytes) {
++    if (!nodeZlib) return null;
++    const out = nodeZlib.inflateRawSync(bytes, { maxOutputLength: 256 * 1024 * 1024 });
++    return new Uint8Array(out.buffer, out.byteOffset, out.length);
++  }
++
++  async function inflateRawAsync(bytes) {
++    const sync = inflateRawSync(bytes);
++    if (sync) return sync;
++    if (typeof DecompressionStream === 'undefined') {
++      throw new Error('compressed-provider: no zlib and no DecompressionStream to inflate with');
++    }
++    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
++    return new Uint8Array(await new Response(stream).arrayBuffer());
++  }
++
++  function clampRange(size, off, len) {
++    let start = Number(off) | 0;
++    let end = start + (Number(len) | 0);
++    if (!Number.isFinite(start) || start < 0) start = 0;
++    if (!Number.isFinite(end) || end < start) end = start;
++    if (start > size) start = size;
++    if (end > size) end = size;
++    return { start, end, len: end - start };
++  }
++
++  // Parse the 32-byte header. Throws on anything that does not describe a
++  // container: a wrong parse here would hand the guest bytes at the wrong
++  // offsets, which is worse than refusing to mount.
++  function parseHeader(bytes) {
++    if (!bytes || bytes.length < HEADER_BYTES) {
++      throw new Error('compressed container: shorter than a header');
++    }
++    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
++    if (view.getUint32(0, true) !== MAGIC) {
++      throw new Error('compressed container: bad magic (not an MBCZ container)');
++    }
++    const version = view.getUint16(4, true);
++    if (version !== VERSION) throw new Error(`compressed container: unsupported version ${version}`);
++    const codec = view.getUint16(6, true);
++    if (codec !== CODEC_DEFLATE) throw new Error(`compressed container: unsupported codec ${codec}`);
++    const blockSize = view.getUint32(8, true);
++    const blockCount = view.getUint32(12, true);
++    const originalSizeLow = view.getUint32(16, true);
++    const originalSizeHigh = view.getUint32(20, true);
++    const indexOffset = view.getUint32(24, true);
++    const headerCrc = view.getUint32(28, true);
++    const expected = crc32(bytes.subarray(0, 28));
++    if (headerCrc !== expected) {
++      throw new Error('compressed container: header CRC mismatch (truncated or corrupt)');
++    }
++    if (!blockSize || !blockCount) throw new Error('compressed container: empty block table');
++    const originalSize = originalSizeHigh * 0x100000000 + originalSizeLow;
++    if (blockCount !== Math.ceil(originalSize / blockSize)) {
++      throw new Error(`compressed container: block count ${blockCount} disagrees with ` +
++        `${originalSize} bytes in ${blockSize}-byte blocks`);
++    }
++    return { blockSize, blockCount, originalSize, indexOffset, codec, version };
++  }
++
++  function parseIndex(bytes, header) {
++    const need = header.blockCount * INDEX_ENTRY_BYTES;
++    if (bytes.length !== need) {
++      throw new Error(`compressed container: index is ${bytes.length} bytes, expected ${need}`);
++    }
++    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
++    const entries = new Array(header.blockCount);
++    let expectedOffset = HEADER_BYTES;
++    let originalTotal = 0;
++    for (let i = 0; i < header.blockCount; i++) {
++      const base = i * INDEX_ENTRY_BYTES;
++      const entry = {
++        index: i,
++        offset: view.getUint32(base, true),
++        compressedLength: view.getUint32(base + 4, true),
++        originalLength: view.getUint32(base + 8, true),
++        stored: (view.getUint32(base + 12, true) & FLAG_STORED) === FLAG_STORED,
++      };
++      // Blocks are written back to back from the end of the header. Proving it
++      // here means a garbage index is refused at mount instead of being read as
++      // plausible offsets into unrelated bytes.
++      if (entry.offset !== expectedOffset) {
++        throw new Error(`compressed container: block ${i} starts at ${entry.offset}, ` +
++          `expected ${expectedOffset}`);
++      }
++      if (!entry.compressedLength || !entry.originalLength) {
++        throw new Error(`compressed container: block ${i} has a zero length`);
++      }
++      if (entry.stored ? entry.compressedLength !== entry.originalLength : entry.compressedLength >= entry.originalLength) {
++        throw new Error(`compressed container: block ${i} store/deflate flag disagrees with its lengths`);
++      }
++      expectedOffset += entry.compressedLength;
++      originalTotal += entry.originalLength;
++      entries[i] = entry;
++    }
++    if (originalTotal !== header.originalSize) {
++      throw new Error(`compressed container: blocks total ${originalTotal} bytes, header says ${header.originalSize}`);
++    }
++    if (expectedOffset !== header.indexOffset) {
++      throw new Error(`compressed container: data ends at ${expectedOffset}, index at ${header.indexOffset}`);
++    }
++    return entries;
++  }
++
++  // The provider. `underlying` is anything provider-shaped over the COMPRESSED
++  // container bytes -- an HttpRangeProvider, a ConcatProvider over .partNNN, a
++  // BlobProvider. `size` is the ORIGINAL size, which is what every consumer
++  // above this layer must see.
++  class CompressedProvider {
++    constructor(underlying, header, entries, options) {
++      const opts = options || {};
++      this.underlying = underlying;
++      this.header = header;
++      this.entries = entries;
++      this.size = header.originalSize;
++      this.blockSize = header.blockSize;
++      this.name = opts.name || underlying.name || '<compressed>';
++      // Inflated blocks, most-recent last. Bounded because the layer above
++      // already caches; this only exists to stop a straddling read from
++      // inflating the same block twice in a row.
++      this._blockCache = new Map();
++      this._maxBlocks = opts.maxBlocks === undefined ? 8 : opts.maxBlocks;
++      this.stats = { blocksInflated: 0, inflateBytes: 0, cacheHits: 0 };
++    }
++
++    // Read the index once, lazily: a mount costs one header read, and a file the
++    // guest never opens costs nothing more.
++    static async open(underlying, options) {
++      if (!underlying || typeof underlying.readRange !== 'function') {
++        throw new Error('CompressedProvider.open: an underlying provider is required');
++      }
++      if (!Number.isSafeInteger(underlying.size) || underlying.size < HEADER_BYTES) {
++        throw new Error('CompressedProvider.open: underlying size is not a container');
++      }
++      const head = new Uint8Array(await underlying.readRange(0, HEADER_BYTES));
++      const header = parseHeader(head);
++      const indexLength = header.blockCount * INDEX_ENTRY_BYTES;
++      if (header.indexOffset + indexLength > underlying.size) {
++        throw new Error('compressed container: index runs past the end of the file');
++      }
++      const indexBytes = new Uint8Array(await underlying.readRange(header.indexOffset, indexLength));
++      const entries = parseIndex(indexBytes, header);
++      return new CompressedProvider(underlying, header, entries, options);
++    }
++
++    // Same contract as the other providers: a synchronous answer when the whole
++    // path can be synchronous, otherwise null so the caller awaits readRange.
++    readRangeSync(off, len) {
++      if (!nodeZlib || typeof this.underlying.readRangeSync !== 'function') return null;
++      const r = clampRange(this.size, off, len);
++      if (!r.len) return new Uint8Array(0);
++      const out = new Uint8Array(r.len);
++      let written = 0;
++      for (const block of this._blocksFor(r.start, r.end)) {
++        const bytes = this._blockSync(block);
++        if (!bytes) return null;
++        written += this._copySlice(bytes, block, r, out, written);
++      }
++      return written === r.len ? out : out.subarray(0, written);
++    }
++
++    async readRange(off, len) {
++      const r = clampRange(this.size, off, len);
++      if (!r.len) return new Uint8Array(0);
++      const out = new Uint8Array(r.len);
++      let written = 0;
++      for (const block of this._blocksFor(r.start, r.end)) {
++        const bytes = await this._block(block);
++        written += this._copySlice(bytes, block, r, out, written);
++      }
++      if (written !== r.len) {
++        throw new Error(`CompressedProvider: delivered ${written} bytes for @${r.start}+${r.len}`);
++      }
++      return out;
++    }
++
++    // Which blocks a byte range touches, plus the sub-range of each.
++    _blocksFor(start, end) {
++      const first = Math.floor(start / this.blockSize);
++      const last = Math.floor((end - 1) / this.blockSize);
++      const out = [];
++      for (let index = first; index <= last; index++) {
++        const entry = this.entries[index];
++        if (!entry) throw new Error(`CompressedProvider: no block ${index} for @${start}+${end - start}`);
++        const blockStart = index * this.blockSize;
++        const from = Math.max(start, blockStart) - blockStart;
++        const to = Math.min(end, blockStart + entry.originalLength) - blockStart;
++        out.push({ index, entry, from, to });
++      }
++      return out;
++    }
++
++    _copySlice(bytes, block, r, out, written) {
++      const slice = bytes.subarray(block.from, block.to);
++      out.set(slice, written);
++      return slice.length;
++    }
++
++    _remember(index, bytes) {
++      if (this._maxBlocks <= 0) return;
++      this._blockCache.delete(index);
++      this._blockCache.set(index, bytes);
++      while (this._blockCache.size > this._maxBlocks) {
++        this._blockCache.delete(this._blockCache.keys().next().value);
++      }
++    }
++
++    _expand(entry, raw) {
++      if (raw.length !== entry.compressedLength) {
++        throw new Error(`CompressedProvider: block ${entry.index} read ${raw.length} bytes, ` +
++          `index says ${entry.compressedLength}`);
++      }
++      if (entry.stored) {
++        if (raw.length !== entry.originalLength) {
++          throw new Error(`CompressedProvider: stored block ${entry.index} is the wrong length`);
++        }
++        return raw;
++      }
++      const bytes = inflateRawSync(raw);
++      if (!bytes) return null;
++      // A block that inflates to the wrong length is corrupt; refusing here
++      // keeps the guest from reading shifted bytes.
++      if (bytes.length !== entry.originalLength) {
++        throw new Error(`CompressedProvider: block ${entry.index} inflated to ${bytes.length}, ` +
++          `index says ${entry.originalLength}`);
++      }
++      return bytes;
++    }
++
++    _blockSync(block) {
++      const cached = this._blockCache.get(block.index);
++      if (cached) { this.stats.cacheHits++; return cached; }
++      const raw = this.underlying.readRangeSync(block.entry.offset, block.entry.compressedLength);
++      if (!raw) return null;
++      const bytes = this._expand(block.entry, raw);
++      if (!bytes) return null;
++      this.stats.blocksInflated++;
++      this.stats.inflateBytes += bytes.length;
++      this._remember(block.index, bytes);
++      return bytes;
++    }
++
++    async _block(block) {
++      const cached = this._blockCache.get(block.index);
++      if (cached) { this.stats.cacheHits++; return cached; }
++      const raw = new Uint8Array(await this.underlying.readRange(
++        block.entry.offset, block.entry.compressedLength));
++      let bytes;
++      if (block.entry.stored) {
++        bytes = this._expand(block.entry, raw);
++      } else {
++        if (raw.length !== block.entry.compressedLength) {
++          throw new Error(`CompressedProvider: block ${block.index} read ${raw.length} bytes, ` +
++            `index says ${block.entry.compressedLength}`);
++        }
++        bytes = await inflateRawAsync(raw);
++        if (bytes.length !== block.entry.originalLength) {
++          throw new Error(`CompressedProvider: block ${block.index} inflated to ${bytes.length}, ` +
++            `index says ${block.entry.originalLength}`);
++        }
++      }
++      this.stats.blocksInflated++;
++      this.stats.inflateBytes += bytes.length;
++      this._remember(block.index, bytes);
++      return bytes;
++    }
++
++    close() { if (this.underlying && this.underlying.close) this.underlying.close(); }
++  }
++
++  const api = {
++    MAGIC,
++    VERSION,
++    HEADER_BYTES,
++    INDEX_ENTRY_BYTES,
++    FLAG_STORED,
++    CompressedProvider,
++    parseHeader,
++    parseIndex,
++    crc32,
++    inflateRawSync,
++    inflateRawAsync,
++  };
++  if (typeof module !== 'undefined' && module.exports) module.exports = api;
++  if (typeof window !== 'undefined') window.compressedProvider = api;
++})();
+diff --git a/test/test-compressed-provider.js b/test/test-compressed-provider.js
+new file mode 100644
+index 00000000..e10ce276
+--- /dev/null
++++ b/test/test-compressed-provider.js
+@@ -0,0 +1,180 @@
++#!/usr/bin/env node
++'use strict';
++
++// lib/compressed-provider.js + tools/compress-assets.js: a block-compressed
++// container must be indistinguishable from the original file to every layer
++// above the provider.
++//
++// That indirection is the entire risk. The guest, the VFS, ChunkCache and
++// preloadRanges all believe they are reading `0002.p` at its real size; if the
++// provider is off by one byte, or inflates a block at the wrong offset, or
++// reports the container's size instead of the original, the guest gets
++// plausible garbage. A texture that is resident but wrong is the worst failure
++// this project has, because the game caches it.
++//
++// So this drives the real packer and the real provider through the real
++// ChunkCache the host mounts, and compares every byte.
++
++const assert = require('assert');
++const fs = require('fs');
++const os = require('os');
++const path = require('path');
++const zlib = require('zlib');
++const { execFileSync } = require('child_process');
++
++const byteProvider = require('../lib/byte-provider');
++const compressed = require('../lib/compressed-provider');
++
++const TOOL = path.join(__dirname, '..', 'tools', 'compress-assets.js');
++const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mbcz-'));
++const src = path.join(dir, 'src');
++const out = path.join(dir, 'out');
++fs.mkdirSync(src);
++
++function run(args) {
++  return execFileSync(process.execPath, [TOOL, ...args], { encoding: 'utf8' });
++}
++
++// Three shapes: a multi-block file with mixed compressibility, a file that is
++// not a block multiple, and a file smaller than one block (which must still
++// round-trip, header overhead or not).
++function buildFixtures(blockSize) {
++  const parts = [];
++  for (let i = 0; i < 12; i++) {
++    const w = 64, h = 64, head = Buffer.alloc(16);
++    head.writeUInt32LE(w, 0); head.writeUInt32LE(h, 4);
++    head.writeUInt32LE(0, 8); head.writeUInt32LE(w * h, 12);
++    const px = Buffer.alloc(w * h);
++    for (let j = 0; j < px.length; j++) {
++      const x = j % w, y = (j / w) | 0;
++      px[j] = (x < 4 || y < 4 || x > w - 5 || y > h - 5) ? 0 : ((j * 7 + i) & 0xff);
++    }
++    parts.push(head, px, Buffer.alloc(1024, 0x20));
++  }
++  // Incompressible bytes: the packer must STORE these blocks, not grow them.
++  // These have to be REAL entropy -- a linear counter mod 256 has a period of
++  // 256 and deflate eats it, which is exactly the mistake that made this
++  // assertion fail against a correct packer.
++  parts.push(require('crypto').randomBytes(200 * 1024));
++  parts.push(Buffer.from('repeating script text. '.repeat(1500)));
++  const big = Buffer.concat(parts);
++  fs.writeFileSync(path.join(src, '0002.p'), big);
++  // Deliberately not a block multiple, and offsets that straddle blocks.
++  fs.writeFileSync(path.join(src, '0003.p'), big.subarray(0, blockSize * 2 + 61));
++  fs.writeFileSync(path.join(src, 'small.dat'), Buffer.from('one short file'));
++  return { big, odd: blockSize * 2 + 61 };
++}
++
++function providerOver(bytes) {
++  return {
++    name: 'container',
++    size: bytes.length,
++    readRangeSync: (off, len) => bytes.subarray(off, Math.min(bytes.length, off + len)),
++    readRange: async (off, len) => new Uint8Array(bytes.subarray(off, Math.min(bytes.length, off + len))),
++  };
++}
++
++(async () => {
++  const BLOCK = 32 * 1024;
++  const names = { ...buildFixtures(BLOCK) };
++  run([src, `--out=${out}`, `--block-size=${BLOCK}`, `--manifest=${path.join(dir, 'compress.json')}`, '--verify']);
++  const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'compress.json'), 'utf8'));
++
++  // The recorded original size is the size the guest must see.
++  for (const record of manifest.files) {
++    assert.strictEqual(record.originalSize, fs.statSync(path.join(src, record.name)).size,
++      `${record.name}: the manifest records the original size`);
++  }
++
++  for (const name of ['0002.p', '0003.p', 'small.dat']) {
++    const original = fs.readFileSync(path.join(src, name));
++    const container = fs.readFileSync(path.join(out, `${name}.mbcz`));
++    const provider = await compressed.CompressedProvider.open(providerOver(container), { name });
++    assert.strictEqual(provider.size, original.length,
++      `${name}: the provider reports the ORIGINAL size, not the container's`);
++
++    // Through the same cache the host mounts (host.js: cached(provider, {maxChunks:4096})).
++    const cache = byteProvider.cached(provider, { maxChunks: 4096 });
++
++    // Sequential 1MB reads: the VFS pattern for a large archive.
++    const rebuilt = new Uint8Array(provider.size);
++    for (let at = 0; at < provider.size; at += 1024 * 1024) {
++      const len = Math.min(1024 * 1024, provider.size - at);
++      rebuilt.set(await cache.readRange(at, len), at);
++    }
++    assert.deepStrictEqual(Buffer.from(rebuilt), original, `${name}: sequential reads rebuild byte-for-byte`);
++
++    // Unaligned reads at block boundaries, which is where an off-by-one shows.
++    const edges = [0, 1, BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK - 1, 2 * BLOCK, provider.size - 2];
++    for (const off of edges) {
++      for (const len of [1, 2, 3, 17, BLOCK - 1]) {
++        if (off < 0 || off + len > provider.size) continue;
++        const got = await cache.readRange(off, len);
++        assert.deepStrictEqual(Buffer.from(got), original.subarray(off, off + len),
++          `${name}: @${off}+${len} matches`);
++      }
++    }
++
++    // Past EOF is clamped, never an over-read.
++    const tail = await cache.readRange(provider.size - 3, 100);
++    assert.deepStrictEqual(Buffer.from(tail), original.subarray(original.length - 3),
++      `${name}: a read past EOF is clamped to the real bytes`);
++
++    // The synchronous path must agree with the asynchronous one; the VFS uses
++    // it wherever the whole path can stay synchronous.
++    const sync = cache.readRangeSync(0, Math.min(100, provider.size));
++    assert.deepStrictEqual(Buffer.from(sync), original.subarray(0, sync.length),
++      `${name}: readRangeSync matches readRange`);
++  }
++
++  // A block that did not compress is stored and flagged, so an already-packed
++  // asset cannot grow by a few bytes per block.
++  const bigRecord = manifest.files.find(f => f.name === '0002.p');
++  assert.ok(bigRecord.storedBlocks > 0,
++    'the incompressible region is stored rather than deflated larger');
++
++  // Corruption must be REFUSED, never served. Each of these would otherwise
++  // hand the guest plausible bytes at the wrong offsets.
++  const good = fs.readFileSync(path.join(out, '0002.p.mbcz'));
++  const corruptions = [
++    ['bad magic', buf => { buf.writeUInt32LE(0xdeadbeef, 0); return buf; }],
++    ['header CRC', buf => { buf[20] ^= 0xff; return buf; }],
++    ['truncated', buf => buf.subarray(0, 40)],
++    ['index offset', buf => { buf.writeUInt32LE(buf.length + 4096, 24); return buf; }],
++  ];
++  for (const [label, corrupt] of corruptions) {
++    const broken = corrupt(Buffer.from(good));
++    let refused = false;
++    try {
++      await compressed.CompressedProvider.open(providerOver(broken), { name: 'x' });
++    } catch (_) {
++      refused = true;
++    }
++    assert.ok(refused, `${label}: the provider refuses to mount`);
++  }
++
++  // A block whose inflated length disagrees with the index is refused at read
++  // time rather than returned short or padded.
++  {
++    const provider = await compressed.CompressedProvider.open(providerOver(Buffer.from(good)), { name: 'x' });
++    provider.entries[0] = { ...provider.entries[0], originalLength: provider.entries[0].originalLength + 1 };
++    let refused = false;
++    try {
++      await provider.readRange(0, 16);
++    } catch (_) {
++      refused = true;
++    }
++    assert.ok(refused, 'an inflated-length mismatch is refused, not served');
++  }
++
++  // The packer's own --verify round-trips through the same parser, so a bad
++  // container is caught at pack time rather than in a browser.
++  const verified = run([src, `--out=${path.join(dir, 'out2')}`, `--block-size=${BLOCK}`, '--verify']);
++  assert.ok(/verified byte-for-byte/.test(verified), 'the packer verifies what it wrote');
++
++  console.log('PASS compressed assets: seekable container round-trips byte-for-byte ' +
++    'through ChunkCache, sync and async, and refuses corruption');
++})().catch(error => {
++  console.error(`FAIL ${error.message}`);
++  process.exit(1);
++});
+diff --git a/tools/compress-assets.js b/tools/compress-assets.js
+new file mode 100644
+index 00000000..db8f4c6c
+--- /dev/null
++++ b/tools/compress-assets.js
+@@ -0,0 +1,318 @@
++#!/usr/bin/env node
++'use strict';
++
++// Pack assets into the seekable MBCZ container that lib/compressed-provider.js
++// reads: fixed-size blocks, each deflated independently, plus an index -- so
++// any byte range costs only the blocks it overlaps.
++//
++//   node tools/compress-assets.js <dir> --out=<dir> [--block-size=262144]
++//        [--only=0002.p,0003.p] [--manifest=FILE] [--level=9]
++//        [--verify] [--keep-names] [--json]
++//
++// WHY NOT gzip THE WHOLE FILE
++//
++// Measured on this project's own data shape: whole-file gzip/brotli reach a
++// better ratio than block-deflate (a long window amortises repeated sprite
++// headers across the whole archive), and they are useless here, because the
++// engine reads by HTTP byte range. To answer `readRange(500MB, 1MB)` from a
++// whole-file gzip you must inflate 500MB first. Blocks trade a few percent of
++// ratio for O(blockSize) access, which is the only property that matters.
++//
++// The container keeps the ORIGINAL file name in the manifest and the provider
++// presents the ORIGINAL size, so the guest -- and the VFS, and preloadRanges --
++// see an uncompressed file of the original length. Nothing above the provider
++// knows the bytes on the wire are compressed.
++
++const fs = require('fs');
++const path = require('path');
++const zlib = require('zlib');
++const crypto = require('crypto');
++
++const MAGIC = 0x5a43424d;          // 'MBCZ'
++const VERSION = 1;
++const CODEC_DEFLATE = 1;
++const HEADER_BYTES = 32;
++const INDEX_ENTRY_BYTES = 16;
++const FLAG_STORED = 1;
++
++function crc32(bytes) {
++  if (!crc32.table) {
++    const table = new Uint32Array(256);
++    for (let i = 0; i < 256; i++) {
++      let c = i;
++      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
++      table[i] = c >>> 0;
++    }
++    crc32.table = table;
++  }
++  let crc = 0xffffffff;
++  for (let i = 0; i < bytes.length; i++) crc = crc32.table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
++  return (crc ^ 0xffffffff) >>> 0;
++}
++
++function usage() {
++  console.error('usage: compress-assets.js <dir> --out=<dir> [--block-size=262144] ' +
++    '[--only=a.p,b.p] [--manifest=FILE] [--level=9] [--verify] [--json]');
++  process.exit(2);
++}
++
++const args = process.argv.slice(2);
++const dirArg = args.find(a => !a.startsWith('--'));
++if (!dirArg) usage();
++const outArg = (args.find(a => a.startsWith('--out=')) || '').slice(6);
++const manifestArg = (args.find(a => a.startsWith('--manifest=')) || '').slice(11);
++const onlyArg = (args.find(a => a.startsWith('--only=')) || '').slice(7);
++const blockArg = args.find(a => a.startsWith('--block-size='));
++const levelArg = args.find(a => a.startsWith('--level='));
++const JSON_OUT = args.includes('--json');
++const VERIFY = args.includes('--verify');
++
++// 256KB blocks: a 1MB read touches 4-5 of them, and a 2.1GB archive indexes to
++// ~8,200 entries (131KB) -- small enough to load before the first read.
++let blockSize = 256 * 1024;
++if (blockArg) {
++  blockSize = Number(blockArg.slice(13));
++  if (!Number.isSafeInteger(blockSize) || blockSize < 4096 || blockSize > 8 * 1024 * 1024) {
++    console.error(`compress-assets: --block-size must be 4096..8388608 (got ${blockArg})`);
++    process.exit(2);
++  }
++}
++let level = 9;
++if (levelArg) {
++  level = Number(levelArg.slice(8));
++  if (!Number.isInteger(level) || level < 1 || level > 9) {
++    console.error(`compress-assets: --level must be 1..9 (got ${levelArg})`);
++    process.exit(2);
++  }
++}
++if (!outArg) usage();
++
++const ASSET_EXTENSIONS = new Set([
++  '.p', '.bin', '.dat', '.exe', '.dll', '.wav', '.mp3', '.ogg', '.avi', '.bmp',
++  '.png', '.jpg', '.jpeg', '.ttf', '.otf', '.pak', '.idx',
++]);
++
++// Container name: the original name plus `.mbcz`. The provider presents the
++// original size, and the app manifest points `url` at this file while keeping
++// the original `size`, so nothing downstream sees the compressed length.
++function containerName(name) { return `${name}.mbcz`; }
++
++function packFile(filePath, name, outDir) {
++  const original = fs.readFileSync(filePath);
++  const originalSize = original.length;
++  const blockCount = Math.ceil(originalSize / blockSize) || 0;
++  if (!blockCount) throw new Error(`${name}: empty file cannot be packed`);
++
++  const blocks = [];
++  const payloads = [];
++  let payloadBytes = HEADER_BYTES;
++  for (let index = 0; index < blockCount; index++) {
++    const start = index * blockSize;
++    const end = Math.min(originalSize, start + blockSize);
++    const raw = original.subarray(start, end);
++    const deflated = zlib.deflateRawSync(raw, { level });
++    // A block that does not pay for itself is stored, flagged, so an already
++    // compressed asset (mp3, png) cannot grow by a few bytes per block.
++    const useStored = deflated.length >= raw.length;
++    const bytes = useStored ? raw : deflated;
++    blocks.push({
++      index,
++      offset: payloadBytes,
++      compressedLength: bytes.length,
++      originalLength: raw.length,
++      stored: useStored,
++    });
++    payloads.push(bytes);
++    payloadBytes += bytes.length;
++  }
++
++  const indexOffset = payloadBytes;
++  const header = Buffer.alloc(HEADER_BYTES);
++  header.writeUInt32LE(MAGIC, 0);
++  header.writeUInt16LE(VERSION, 4);
++  header.writeUInt16LE(CODEC_DEFLATE, 6);
++  header.writeUInt32LE(blockSize, 8);
++  header.writeUInt32LE(blockCount, 12);
++  header.writeUInt32LE(originalSize % 0x100000000, 16);
++  header.writeUInt32LE(Math.floor(originalSize / 0x100000000), 20);
++  header.writeUInt32LE(indexOffset, 24);
++  header.writeUInt32LE(crc32(header.subarray(0, 28)), 28);
++
++  const index = Buffer.alloc(blockCount * INDEX_ENTRY_BYTES);
++  blocks.forEach((block, i) => {
++    const base = i * INDEX_ENTRY_BYTES;
++    index.writeUInt32LE(block.offset, base);
++    index.writeUInt32LE(block.compressedLength, base + 4);
++    index.writeUInt32LE(block.originalLength, base + 8);
++    index.writeUInt32LE(block.stored ? FLAG_STORED : 0, base + 12);
++  });
++
++  const outPath = path.join(outDir, containerName(name));
++  const fd = fs.openSync(outPath, 'w');
++  try {
++    // EVERY write is positioned. A positioned write does NOT advance the fd's
++    // internal file offset, so mixing it with an unpositioned write puts the
++    // next write at offset 0 -- which silently overwrote the header with the
++    // first payload block and produced a container whose first 32 bytes were
++    // asset data. Track the offset explicitly instead.
++    let at = 0;
++    at += fs.writeSync(fd, header, 0, header.length, at);
++    for (const bytes of payloads) at += fs.writeSync(fd, bytes, 0, bytes.length, at);
++    fs.writeSync(fd, index, 0, index.length, at);
++  } finally {
++    fs.closeSync(fd);
++  }
++
++  const containerSize = fs.statSync(outPath).size;
++  return {
++    name,
++    container: containerName(name),
++    path: outPath,
++    originalSize,
++    containerSize,
++    blockSize,
++    blockCount,
++    storedBlocks: blocks.filter(b => b.stored).length,
++    sha256: crypto.createHash('sha256').update(original).digest('hex'),
++    containerSha256: crypto.createHash('sha256').update(fs.readFileSync(outPath)).digest('hex'),
++    ratio: originalSize ? containerSize / originalSize : 1,
++  };
++}
++
++// Re-inflate every block through the SAME parser the browser uses, and compare
++// the reassembled bytes with the source. Compression is only safe if this
++// passes: a container that decompresses to the wrong bytes is a silently
++// corrupt asset, which is the worst failure mode this project has (a texture
++// that is resident but wrong).
++async function verifyContainer(record, sourceDir) {
++  const { CompressedProvider } = require('../lib/compressed-provider');
++  const bytes = fs.readFileSync(record.path);
++  const provider = {
++    name: record.container,
++    size: bytes.length,
++    readRangeSync: (off, len) => bytes.subarray(off, Math.min(bytes.length, off + len)),
++    readRange: async (off, len) => bytes.subarray(off, Math.min(bytes.length, off + len)),
++  };
++  const wrapped = await CompressedProvider.open(provider, { name: record.name });
++  if (wrapped.size !== record.originalSize) {
++    return { ok: false, reason: `provider size ${wrapped.size} != original ${record.originalSize}` };
++  }
++  const original = fs.readFileSync(path.join(sourceDir, record.name));
++  // Read the whole thing in 1MB reads, which is what ChunkCache does, plus a
++  // few deliberately unaligned ranges so a straddling block is exercised.
++  const rebuilt = new Uint8Array(wrapped.size);
++  for (let at = 0; at < wrapped.size; at += 1024 * 1024) {
++    const len = Math.min(1024 * 1024, wrapped.size - at);
++    rebuilt.set(await wrapped.readRange(at, len), at);
++  }
++  if (Buffer.compare(Buffer.from(rebuilt), original) !== 0) {
++    return { ok: false, reason: 'rebuilt bytes differ from the source' };
++  }
++  for (const [off, len] of [[0, 1], [1, 3], [record.blockSize - 1, 2], [record.blockSize, 1],
++    [Math.max(0, wrapped.size - 7), 7]]) {
++    const slice = await wrapped.readRange(off, len);
++    const want = original.subarray(off, Math.min(original.length, off + len));
++    if (Buffer.compare(Buffer.from(slice), want) !== 0) {
++      return { ok: false, reason: `unaligned range @${off}+${len} differs` };
++    }
++  }
++  return { ok: true };
++}
++
++(async () => {
++  const sourceDir = path.resolve(dirArg);
++  if (!fs.existsSync(sourceDir) || !fs.statSync(sourceDir).isDirectory()) {
++    console.error(`compress-assets: ${sourceDir} is not a directory`);
++    process.exit(2);
++  }
++  let names = fs.readdirSync(sourceDir)
++    .filter(name => ASSET_EXTENSIONS.has(path.extname(name).toLowerCase()))
++    .filter(name => !/\.(mbcz|part\d{3})$/.test(name))
++    .sort();
++  if (onlyArg) {
++    const wanted = onlyArg.split(',').map(s => s.trim()).filter(Boolean);
++    const missing = wanted.filter(name => !names.includes(name));
++    if (missing.length) {
++      console.error(`compress-assets: --only names ${missing.join(', ')} but the directory has no such file`);
++      process.exit(1);
++    }
++    names = names.filter(name => wanted.includes(name));
++  }
++  if (!names.length) {
++    console.error(`compress-assets: no assets in ${sourceDir}`);
++    process.exit(1);
++  }
++  fs.mkdirSync(outArg, { recursive: true });
++
++  const records = [];
++  for (const name of names) records.push(packFile(path.join(sourceDir, name), name, outArg));
++
++  let failed = 0;
++  if (VERIFY) {
++    for (const record of records) {
++      const result = await verifyContainer(record, sourceDir);
++      if (!result.ok) { failed++; console.error(`FAIL ${record.name}: ${result.reason}`); }
++    }
++  }
++
++  const totalOriginal = records.reduce((n, r) => n + r.originalSize, 0);
++  const totalContainer = records.reduce((n, r) => n + r.containerSize, 0);
++  const manifest = {
++    schemaVersion: 1,
++    container: 'MBCZ',
++    version: VERSION,
++    codec: 'deflate-raw',
++    blockSize,
++    level,
++    files: records.map(r => ({
++      name: r.name,
++      container: r.container,
++      originalSize: r.originalSize,
++      containerSize: r.containerSize,
++      blockSize: r.blockSize,
++      blockCount: r.blockCount,
++      storedBlocks: r.storedBlocks,
++      sha256: r.sha256,
++      containerSha256: r.containerSha256,
++    })),
++    totals: {
++      files: records.length,
++      originalBytes: totalOriginal,
++      containerBytes: totalContainer,
++      ratio: totalOriginal ? totalContainer / totalOriginal : 1,
++    },
++  };
++
++  // Bytes for a small file, MB for a large one: a 33-byte file printed as
++  // "0.0MB -> 0.0MB (-145.5% smaller)" is worse than useless, and a negative
++  // percentage reads as a bug in the tool rather than as the header overhead it
++  // actually is.
++  const size = n => (n >= 1024 * 1024
++    ? `${(n / 1048576).toFixed(1)}MB`
++    : `${n}B`);
++  const verdict = (original, container) => {
++    const saved = original - container;
++    return saved >= 0
++      ? `${((saved / original) * 100).toFixed(1)}% smaller`
++      : `${size(-saved)} LARGER (header overhead on a tiny file)`;
++  };
++  if (!JSON_OUT) {
++    for (const r of records) {
++      console.log(`${r.name}: ${size(r.originalSize)} -> ${size(r.containerSize)} ` +
++        `(${verdict(r.originalSize, r.containerSize)}, ${r.blockCount} blocks, ` +
++        `${r.storedBlocks} stored)`);
++    }
++    console.log(`total: ${size(totalOriginal)} -> ${size(totalContainer)} ` +
++      `(${verdict(totalOriginal, totalContainer)})`);
++    if (VERIFY) console.log(failed ? `${failed} file(s) FAILED verification` : 'all files verified byte-for-byte');
++  }
++  if (manifestArg) {
++    fs.writeFileSync(manifestArg, JSON.stringify(manifest, null, 2) + '\n');
++    if (!JSON_OUT) console.log(`wrote ${manifestArg}`);
++  }
++  if (JSON_OUT) console.log(JSON.stringify(manifest, null, 2));
++  process.exit(failed ? 1 : 0);
++})().catch(error => {
++  console.error(`compress-assets: ${error.message}`);
++  process.exit(1);
++});
+-- 
+2.39.5
+

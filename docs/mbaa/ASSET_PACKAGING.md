@@ -3,16 +3,18 @@
 Two things in the original brief do not survive contact with the engine, and
 they are the reason this document exists rather than a one-line command list:
 
-1. **The assets cannot be compressed.** The engine reads a `.p` archive by HTTP
-   *byte range* (`lib/byte-provider.js` `HttpRangeProvider`, joined across parts
-   by `ConcatProvider`). A compressed part has no meaningful byte range: the
-   loader would request bytes 1000–2000 of the *compressed* stream and hand the
-   guest whatever that happens to land on. The repo already proves this in
-   `lib/byte-provider.js` — the only "inflate" mention is for a small in-memory
-   mount, never for a ranged one. So the parts are **raw bytes, always**. If you
-   want transfer compression it has to be `Content-Encoding` applied by the host
-   to a *whole* response, which is mutually exclusive with `Range`. Pick one:
-   ranged streaming (this pipeline) or whole-file compressed downloads.
+1. **Compression works, but it must be seekable — and now is.** An earlier
+   revision of this document said the assets "cannot be compressed"; that was
+   wrong. What is true is narrower: a *whole-file* gzip/brotli stream cannot be
+   read by byte range, and the engine reads `.p` archives exactly that way
+   (`lib/byte-provider.js` `HttpRangeProvider`). Block-compressing the file and
+   indexing the blocks solves it — see
+   [COMPRESSED_ASSETS.md](COMPRESSED_ASSETS.md), `tools/compress-assets.js` and
+   `lib/compressed-provider.js`. Parts cut from an MBCZ container are still raw
+   bytes on the wire; the *content* of those bytes is compressed, and the
+   provider decompresses them so the guest sees the original file.
+   `Content-Encoding` remains a separate, whole-response option and stays
+   incompatible with `Range`.
 
 2. **`wrangler put` is not a Wrangler command.** KV uploads are
    `wrangler kv key put --path <file>` or `wrangler kv bulk put`. The driver

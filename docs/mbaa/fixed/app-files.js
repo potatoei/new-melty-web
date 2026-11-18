@@ -55,6 +55,15 @@
     return url ? url.replace(/^.*\//, '') : String(file && file.url || file);
   }
 
+  // `compressed: true` names a container in lib/compressed-provider.js's MBCZ
+  // format. Its `size` is the DECOMPRESSED length (that is what the guest and
+  // the VFS must see) and `compressedSize` is the length on the wire, so every
+  // size-based rule in this file would otherwise be answering about the wrong
+  // number -- and the size mismatch is exactly what the preload policy refuses.
+  function declaresCompressed(file) {
+    return !!(file && typeof file === 'object' && file.compressed === true);
+  }
+
   // Read by something that cannot park on a cache miss: the PE/DLL loader
   // (images, codecs, plug-ins, type libraries), resource and font loading,
   // INI/registry-ish config, fonts and WinHelp.
@@ -172,7 +181,13 @@
     const preloadWhole = [];
     const preloadSkipped = [];
     const out = list.map((file, i) => {
-      if (!fileUrl(file) || declaresLoading(file)) return file;
+      // A block-compressed container is mounted by host.js through
+      // lib/compressed-provider.js, which presents the ORIGINAL size to
+      // everything above it. The policy must not re-derive that entry: forcing
+      // it 'required' would fetch the container whole (defeating the point of
+      // streaming it), and httpRange on a container whose manifest size is the
+      // decompressed length would ask the host for bytes that do not exist.
+      if (!fileUrl(file) || declaresLoading(file) || declaresCompressed(file)) return file;
       const size = sizes[i];
       const wanted = preload.length &&
         preloadCandidates(file).some(path => preload.some(re => re.test(path)));
